@@ -1,0 +1,13 @@
+# 主要依赖
+# requests>=2.28.0  # 已使用内置urllib替代
+
+# Python内置模块（无需安装）
+# sqlite3
+# pathlib  
+# dataclasses
+# typing
+# json
+# datetime
+# os
+# sys
+# urllib
