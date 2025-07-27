@@ -4,16 +4,27 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 var addr = "127.0.0.1:2002"
+
+// Pre-compile regex for better performance
+var dirRegex = regexp.MustCompile("^/dir(.*)")
+
+// Buffer pool for reducing memory allocations
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
 
 func main() {
 	//127.0.0.1:2002/xxx
@@ -39,8 +50,7 @@ func NewSingleHostReverseProxy(target *url.URL) *httputil.ReverseProxy {
 		//127.0.0.1:2002/dir/abc ==> 127.0.0.1:2003/base/abc ??
 		//127.0.0.1:2002/dir/abc ==> 127.0.0.1:2002/abc
 		//127.0.0.1:2002/abc ==> 127.0.0.1:2003/base/abc
-		re, _ := regexp.Compile("^/dir(.*)");
-		req.URL.Path = re.ReplaceAllString(req.URL.Path, "$1")
+		req.URL.Path = dirRegex.ReplaceAllString(req.URL.Path, "$1")
 
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
@@ -60,15 +70,27 @@ func NewSingleHostReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	modifyFunc := func(res *http.Response) error {
 		if res.StatusCode != 200 {
 			return errors.New("error statusCode")
-			oldPayload, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				return err
-			}
-			newPayLoad := []byte("hello " + string(oldPayload))
-			res.Body = ioutil.NopCloser(bytes.NewBuffer(newPayLoad))
-			res.ContentLength = int64(len(newPayLoad))
-			res.Header.Set("Content-Length", fmt.Sprint(len(newPayLoad)))
 		}
+		
+		// Use buffer pool to reduce memory allocations
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+		
+		oldPayload, err := io.ReadAll(res.Body)
+		if err != nil {
+			return err
+		}
+		res.Body.Close()
+		
+		// Pre-allocate buffer with exact size needed
+		newPayload := make([]byte, 6+len(oldPayload))
+		copy(newPayload, "hello ")
+		copy(newPayload[6:], oldPayload)
+		
+		res.Body = io.NopCloser(bytes.NewReader(newPayload))
+		res.ContentLength = int64(len(newPayload))
+		res.Header.Set("Content-Length", fmt.Sprint(len(newPayload)))
 		return nil
 	}
 	errorHandler := func(res http.ResponseWriter, req *http.Request, err error) {
