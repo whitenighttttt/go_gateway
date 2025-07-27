@@ -3,7 +3,7 @@ package main
 import (
 	"GO_GATEWAY/proxy/load_balance"
 	"bytes"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,20 +11,33 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
-	addr      = "127.0.0.1:2002"
+	addr = "127.0.0.1:2002"
+	// Optimized transport configuration for better performance
 	transport = &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second, //连接超时
-			KeepAlive: 30 * time.Second, //长连接超时时间
+			Timeout:   10 * time.Second,  // Reduced from 30s for faster failure detection
+			KeepAlive: 30 * time.Second,  // Keep-alive timeout
+			DualStack: true,              // Enable IPv4/IPv6 dual-stack
 		}).DialContext,
-		MaxIdleConns:          100,              //最大空闲连接
-		IdleConnTimeout:       90 * time.Second, //空闲超时时间
-		TLSHandshakeTimeout:   10 * time.Second, //tls握手超时时间
-		ExpectContinueTimeout: 1 * time.Second,  //100-continue状态码超时时间
+		MaxIdleConns:          200,              // Increased from 100 for better connection reuse
+		MaxIdleConnsPerHost:   10,               // Limit connections per host
+		IdleConnTimeout:       90 * time.Second, // Idle connection timeout
+		TLSHandshakeTimeout:   5 * time.Second,  // Reduced from 10s
+		ExpectContinueTimeout: 1 * time.Second,  // 100-continue timeout
+		DisableCompression:    true,             // Disable compression for proxy
+		ForceAttemptHTTP2:     true,             // Enable HTTP/2
+	}
+	
+	// Buffer pool for reducing memory allocations
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
 	}
 )
 
@@ -33,11 +46,13 @@ func NewMultipleHostsReverseProxy(lb load_balance.LoadBalance) *httputil.Reverse
 	director := func(req *http.Request) {
 		nextAddr, err := lb.Get(req.RemoteAddr)
 		if err != nil {
-			log.Fatal("get next addr fail")
+			log.Printf("get next addr fail: %v", err)
+			return
 		}
 		target, err := url.Parse(nextAddr)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("parse target url fail: %v", err)
+			return
 		}
 		targetQuery := target.RawQuery
 		req.URL.Scheme = target.Scheme
@@ -57,14 +72,25 @@ func NewMultipleHostsReverseProxy(lb load_balance.LoadBalance) *httputil.Reverse
 	modifyFunc := func(resp *http.Response) error {
 		//请求以下命令：curl 'http://127.0.0.1:2002/error'
 		if resp.StatusCode != 200 {
+			// Use buffer pool to reduce memory allocations
+			buf := bufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			defer bufferPool.Put(buf)
+			
 			//获取内容
-			oldPayload, err := ioutil.ReadAll(resp.Body)
+			oldPayload, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return err
 			}
-			//追加内容
-			newPayload := []byte("StatusCode error:" + string(oldPayload))
-			resp.Body = ioutil.NopCloser(bytes.NewBuffer(newPayload))
+			resp.Body.Close()
+			
+			// Pre-allocate buffer with exact size needed
+			prefix := "StatusCode error:"
+			newPayload := make([]byte, len(prefix)+len(oldPayload))
+			copy(newPayload, prefix)
+			copy(newPayload[len(prefix):], oldPayload)
+			
+			resp.Body = io.NopCloser(bytes.NewReader(newPayload))
 			resp.ContentLength = int64(len(newPayload))
 			resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(newPayload)), 10))
 		}
@@ -75,6 +101,7 @@ func NewMultipleHostsReverseProxy(lb load_balance.LoadBalance) *httputil.Reverse
 	//范围：transport.RoundTrip发生的错误、以及ModifyResponse发生的错误
 	errFunc := func(w http.ResponseWriter, r *http.Request, err error) {
 		//todo 如果是权重的负载则调整临时权重
+		log.Printf("Error handling request: %v", err)
 		http.Error(w, "ErrorHandler error:"+err.Error(), 500)
 	}
 

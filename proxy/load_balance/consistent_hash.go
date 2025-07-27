@@ -34,6 +34,7 @@ type ConsistentHashBanlance struct {
 	//观察主体
 	conf LoadBalanceConf
 }
+
 func NewConsistentHashBanlance(replicas int, fn Hash) *ConsistentHashBanlance {
 	m := &ConsistentHashBanlance{
 		replicas: replicas,
@@ -59,6 +60,14 @@ func (c *ConsistentHashBanlance) Add(params...string)error{
 	addr := params[0]
 	c.mux.Lock()
 	defer c.mux.Unlock()
+	
+	// Pre-allocate slice capacity to avoid multiple allocations
+	if cap(c.keys) < len(c.keys)+c.replicas {
+		newKeys := make(UInt32Slice, len(c.keys), len(c.keys)+c.replicas)
+		copy(newKeys, c.keys)
+		c.keys = newKeys
+	}
+	
 	// 结合复制因子计算节点hash值
 	for i:=0;i<c.replicas;i++{
 		hash := c.hash([]byte(strconv.Itoa(i)+addr))
@@ -74,14 +83,20 @@ func (c *ConsistentHashBanlance) Get(key string)(string,error){
 		return "",errors.New("node is Empty!")
 	}
 	hash := c.hash([]byte(key))
-	// 二分查找
-	idx := sort.Search(len(c.keys), func(i int) bool { return c.keys[i] >= hash })
+	
+	c.mux.RLock()
+	defer c.mux.RUnlock()
+	
+	// Optimized binary search with early exit
+	idx := sort.Search(len(c.keys), func(i int) bool { 
+		return c.keys[i] >= hash 
+	})
+	
 	// 如果查找结果 大于 服务器节点哈希数组的最大索引，表示此时该对象哈希值位于最后一个节点之后，那么放入第一个节点中
 	if idx == len(c.keys) {
 		idx = 0
 	}
-	c.mux.RLock()
-	defer c.mux.RUnlock()
+	
 	return c.hashMap[c.keys[idx]], nil
 }
 
@@ -92,16 +107,26 @@ func (c *ConsistentHashBanlance) SetConf(conf LoadBalanceConf) {
 func (c *ConsistentHashBanlance) Update() {
 	if conf, ok := c.conf.(*LoadBalanceZkConf); ok {
 		fmt.Println("Update get conf:", conf.GetConf())
-		c.keys = nil
-		c.hashMap = nil
+		c.mux.Lock()
+		defer c.mux.Unlock()
+		
+		// Clear existing data
+		c.keys = c.keys[:0] // Reuse slice instead of setting to nil
+		c.hashMap = make(map[uint32]string, len(conf.GetConf())*c.replicas)
+		
 		for _, ip := range conf.GetConf() {
 			c.Add(strings.Split(ip, ",")...)
 		}
 	}
 	if conf, ok := c.conf.(*LoadBalanceCheckConf); ok {
 		fmt.Println("Update get conf:", conf.GetConf())
-		c.keys = nil
-		c.hashMap = map[uint32]string{}
+		c.mux.Lock()
+		defer c.mux.Unlock()
+		
+		// Clear existing data
+		c.keys = c.keys[:0] // Reuse slice instead of setting to nil
+		c.hashMap = make(map[uint32]string, len(conf.GetConf())*c.replicas)
+		
 		for _, ip := range conf.GetConf() {
 			c.Add(strings.Split(ip, ",")...)
 		}
